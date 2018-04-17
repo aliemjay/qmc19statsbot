@@ -23,17 +23,22 @@
 #
 from datetime import datetime
 from telegram.ext import Handler
+from threading import Lock
 import logging, time
 
 class ConversationHandler(Handler):
     """handles conversations seperately.
     params:
         conversation_cls: a subclass of Conversation
+        responsive: if true, updates to a conv with an already running handler
+            are queued for execution and thus may render the pool useless since
+            they will block waiting for conv lock. Otherwise, they are ignored
         **kwargs: passed as is to conversation_cls.__init__()"""
 
-    def __init__(self, conversation_cls, **kwargs):
+    def __init__(self, conversation_cls, responsive=False, **kwargs):
         super(Handler, self).__init__()
         self.conversation_cls = conversation_cls
+        self.responsive = responsive
         self.passed_kwargs = kwargs
         #dict of {int chat_id: obj conversation_cls}
         self.conversations = {}
@@ -44,7 +49,9 @@ class ConversationHandler(Handler):
             else False
 
     def handle_update(self, update, dispatcher):
-
+        """handle update by the dispatcher thread, it should be a lightweight
+        handler and further processing is relayed to the thread pool.
+        WARNING: unexpected behaviour: """
         if not update.effective_chat.id in self.conversations:
             #initiate new one
             self.conversations[update.effective_chat.id] = \
@@ -52,16 +59,30 @@ class ConversationHandler(Handler):
                 bot=dispatcher.bot,
                 chat=update.effective_chat,
                 **self.passed_kwargs)
+            self.conversations[update.effective_chat.id]._hlock = \
+                Lock()
 
         #handle update by type: command or message
         conv = self.conversations[update.effective_chat.id]
-        if update.message.text.startswith("/"):
-            conv.handle_command(update.message)
-        else:
-            conv.handle_message(update.message)
+        lock = conv._hlock
+        
+        if self.responsive or not lock.locked():
+            dispatcher.run_async(self._pooled_handler, conv=conv, lock=lock,
+                msg=update.message)
+        #otherwise, ignore
+            
+            
+    def _pooled_handler(self, conv, lock, msg):
+        #print(conv, lock)
+        with lock:
+            if msg.text.startswith("/"):
+                conv.handle_command(msg)
+            else:
+                conv.handle_message(msg)
+        
 
 class Conversation:
-    """base class for other conversations
+    """base class for other conversations.
     any of the defined methods should not be overrided.
     Atrributes:
         chat; bot; apolo_system;
@@ -76,7 +97,6 @@ class Conversation:
     def __init__(self, bot, chat,
         apolo_system = None, **kwargs):
         """pass kwargs to on_load"""
-
         self.chat = chat
         self.bot = bot
         self.apolo_system = apolo_system
@@ -91,7 +111,7 @@ class Conversation:
     def send_message(self, *args, **kwargs):
         try:
             msg = self.bot.send_message(
-                chat_id = self.chat.id, *args, timeout=2, **kwargs)
+                chat_id = self.chat.id, *args, timeout=3, **kwargs)
             self.last_message_id = msg.message_id
             return msg
         except:
@@ -137,12 +157,36 @@ class Conversation:
     def on_message(self, msg):
         pass
 
+class StackedHandler:
+    pass
+
 class MainConversation(Conversation):
     def on_load(self, **kwargs):
-        pass
+        self.call_stack=[]
+        self.data_stack=[]
     
+    def call_handler(self, hdlr, params_dict=None, **params_kwargs):
+        params = params_dict if params_dict else params_kwargs
+        self.data_stack.append(params)
+        self.call_stack.append(hdlr)
+        hdlr(state=params)
+        
+    def return_from_handler(self):
+        self.call_stack.pop()
+        retVal = self.data_stack.pop()
+        self.call_stack[-1](state=self.data_stack[-1], ret_state=retVal)
+        
+    def hRegistration(self, state, ret_state=None):
+        if not ret_state:
+            self.call_handler(self.getMessage, tag='')
+            
+    def getMessage(self, state, msg=None, ret_data=None):
+        if msg:
+            state['msg'] = msg.text
+            self.return_from_handler()
+        
     def on_message(self, msg):
-        logging.debug('cello: sleeping 5 secs')
+        logging.debug(': sleeping 5 secs')
         self.send_message(text=msg.text)
         
     def on_apolo(self, msg):
@@ -163,7 +207,7 @@ def test(args):
     updater = tg.Updater(token)
     apolo = ApoloSystem(updater.update_queue)
     main_handler = ConversationHandler(MainConversation,
-        apolo_system=apolo)
+            responsive=False, apolo_system=apolo)
     updater.dispatcher.add_handler(main_handler)
     apolo.start()
     updater.start_polling(timeout=120)
