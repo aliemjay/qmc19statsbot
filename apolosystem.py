@@ -55,32 +55,32 @@ class ApoloSystem(Thread):
     def run(self):
         """check regularly for network status;
         if up, notify every registered chat"""
+        check_connection = False
+        
         while True:
         
             with self.apolo_condition:
-            
-                if len(self.notifiable_convs) == 0 and not self.set_stop:
-                    self.apolo_condition.wait()
-                    
                 if self.set_stop:
                     break
+                elif len(self.notifiable_convs) > 0:
+                    check_connection = True
+                else:
+                    self.apolo_condition.wait() #wait for case worth handling
+                    check_connection = False
                     
+            if check_connection:
                 try:
                     sk = socket.create_connection(
                             ('149.154.167.220', 80), timeout=2)
                     sk.close()
-                    for conv in self.notifiable_convs:
-                        self.notify(conv)
-                    self.notifiable_convs = []
+                    with self.apolo_condition:
+                        for conv in self.notifiable_convs:
+                            self.notify(conv)
+                        self.notifiable_convs = []
                     logging.debug('cello: Apolo: notification dispatched')
-                    connection_error = False
                     
                 except Exception:
                     logging.warning('cello: Apolo: network disconnected')
-                    connection_error = True
-                    
-                    
-            if connection_error:
-                time.sleep(5)
+                    time.sleep(5)
 
         self.__finished.set()
