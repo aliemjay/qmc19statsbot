@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-from threading import Thread, Lock
+#TODO: sync ApoloSystem.conversations
+
+from threading import Thread, Lock, Event, Condition
 from datetime import datetime
 from telegram import Message, Update
 import socket, time, logging
@@ -9,14 +11,15 @@ class ApoloSystem(Thread):
     def __init__(self, update_queue):
         super().__init__()
         
-        self.__lock = Lock()
-        self.set_stop = False
+        self.__finished = Event()
         
         self.update_queue = update_queue
         self.conversations=[]
         
         self.notifiable_convs = []
-        self.notifiable_convs_lock = Lock()
+        self.set_stop = False
+        self.apolo_condition = Condition() 
+        #protects notifiable_convs and set_stop
 
     def register_conversation(self, conv):
         if not conv in self.conversations:
@@ -24,9 +27,10 @@ class ApoloSystem(Thread):
 
     def notify_on_network(self, conv):
         """register a conv for notification when network recovered"""
-        with self.notifiable_convs_lock:
+        with self.apolo_condition:
             if not conv in self.notifiable_convs:
                 self.notifiable_convs.append(conv)
+                self.apolo_condition.notify()
                 logging.debug('cello: Apolo: conv registered')
 
     def notify(self, conv):
@@ -43,32 +47,40 @@ class ApoloSystem(Thread):
 
     def stop(self):
         """stops the thread, blocks until run() completes a cycle"""
-        self.set_stop = True
-        self.__lock.acquire()
-        self.__lock.release()
+        with self.apolo_condition:
+            self.set_stop = True
+            self.apolo_condition.notify()
+        self.__finished.wait()
 
     def run(self):
         """check regularly for network status;
         if up, notify every registered chat"""
-        self.__lock.acquire()
-        sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sk
-        while not self.set_stop:
-
-            try:
-                sk = socket.create_connection(
-                    ('149.154.167.220', 80), timeout=2)
-                sk.close()
-                if len(self.notifiable_convs) == 0:
-                    continue
-                with self.notifiable_convs_lock:
+        while True:
+        
+            with self.apolo_condition:
+            
+                if len(self.notifiable_convs) == 0 and not self.set_stop:
+                    self.apolo_condition.wait()
+                    
+                if self.set_stop:
+                    break
+                    
+                try:
+                    sk = socket.create_connection(
+                            ('149.154.167.220', 80), timeout=2)
+                    sk.close()
                     for conv in self.notifiable_convs:
                         self.notify(conv)
                     self.notifiable_convs = []
                     logging.debug('cello: Apolo: notification dispatched')
-            except Exception:
-                logging.warning('cello: Apolo: network disconnected')
-            
-            time.sleep(5)
+                    connection_error = False
+                    
+                except Exception:
+                    logging.warning('cello: Apolo: network disconnected')
+                    connection_error = True
+                    
+                    
+            if connection_error:
+                time.sleep(5)
 
-        self.__lock.release()
+        self.__finished.set()
